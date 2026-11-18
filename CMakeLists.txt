@@ -42,6 +42,7 @@ add_executable(MoviePlayer WIN32
     src/MpvPlayer.cpp
     src/PlaybackInfo.cpp
     src/Playlist.cpp
+    src/PlaylistPanel.cpp
     src/Settings.cpp
     src/SettingsDialog.cpp
     src/Shortcuts.cpp

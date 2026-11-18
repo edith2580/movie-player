@@ -39,7 +39,7 @@ constexpr int kMaxScreenPercent = 90;
 constexpr int kMinVideoWidth = 320;
 constexpr UINT_PTR kIdleTimer = 1;
 constexpr UINT kIdleDelayMs = 2000;
-constexpr UINT_PTR kDropRetryTimer = 3;
+constexpr UINT_PTR kOpenRetryTimer = 3;
 constexpr UINT_PTR kSeriesTimer = 4;
 constexpr UINT WM_SERIES_FOUND = WM_APP + 2;
 // Explorer opens each of several selected files as its own copy of the app, which hands
@@ -52,9 +52,9 @@ struct SeriesResult {
     std::wstring video;
     std::vector<std::wstring> series;
 };
-// Right after a drag from Explorer, a file on a virtual drive such as RaiDrive can open
-// but not yet give its real contents. Opening the same path without a drag works.
-constexpr UINT kDropRetryDelaysMs[] = {500, 1000, 2000};
+// Right after opening or dragging from Explorer, a file on a network or virtual drive
+// such as RaiDrive can open before its real contents are readable.
+constexpr UINT kOpenRetryDelaysMs[] = {500, 1000, 1500, 2000, 3000};
 
 // After a seek is released, keep showing its target until mpv gets there, so the
 // bar doesn't jump back to the old position. The expiry covers a seek that lands
@@ -110,7 +110,7 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
     RECT client{};
     GetClientRect(window_, &client);
     videoWindow_ = CreateWindowExW(
-        0, kVideoWindowClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0, kVideoWindowClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         0, 0, client.right, client.bottom,
         window_, nullptr, instance, nullptr);
     if (!videoWindow_) {
@@ -126,6 +126,20 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
     EnableWindow(videoWindow_, FALSE);
 
     controlBar_ = std::make_unique<ControlBar>(window_);
+    PlaylistPanel::Callbacks panelCallbacks;
+    panelCallbacks.onAnimationStep = [this] { LayoutChildren(); };
+    panelCallbacks.onPlayItem = [this](size_t index) { PlayPlaylistItem(index); };
+    panelCallbacks.onToggleAutoAdvance = [this] { ToggleAutoAdvance(); };
+    panelCallbacks.onToggleRepeatOne = [this] { ToggleRepeatOne(); };
+    panelCallbacks.onToggleRepeatAll = [this] { ToggleRepeatAll(); };
+    panelCallbacks.onTogglePause = [this] {
+        player_->TogglePause();
+        ShowControls();
+    };
+    playlistPanel_ = std::make_unique<PlaylistPanel>(window_, instance, std::move(panelCallbacks));
+    playlistPanel_->SetToggleShortcut(preferences_.shortcuts[static_cast<size_t>(ShortcutAction::PlaylistShow)]);
+    SyncPlaylistPanel();
+
     RestoreWindowPosition(settings);
     LayoutChildren();
 
@@ -148,20 +162,37 @@ void MainWindow::Show(int showCommand) {
     UpdateWindow(window_);
 }
 
+void MainWindow::ArmOpenRetry(const std::wstring& path, const std::wstring& preferredSubtitle) {
+    KillTimer(window_, kOpenRetryTimer);
+    openRetryPath_ = path;
+    openRetrySubtitle_ = preferredSubtitle;
+    openRetryCount_ = 0;
+}
+
+void MainWindow::ClearOpenRetry() {
+    KillTimer(window_, kOpenRetryTimer);
+    openRetryPath_.clear();
+    openRetrySubtitle_.clear();
+    openRetryCount_ = 0;
+}
+
 void MainWindow::HandlePlaybackError(const std::wstring& reason, bool unrecognizedFormat) {
-    if (unrecognizedFormat && !dropRetryPath_.empty() && dropRetryCount_ < std::size(kDropRetryDelaysMs)) {
-        SetTimer(window_, kDropRetryTimer, kDropRetryDelaysMs[dropRetryCount_++], nullptr);
+    if (unrecognizedFormat && !openRetryPath_.empty() && openRetryCount_ < std::size(kOpenRetryDelaysMs)) {
+        const UINT delay = kOpenRetryDelaysMs[openRetryCount_++];
+        if (openRetryCount_ >= 2 && player_) {
+            player_->ShowMessage(L"파일을 읽는 중...");
+        }
+        SetTimer(window_, kOpenRetryTimer, delay, nullptr);
         return;
     }
-    dropRetryPath_.clear();
+    ClearOpenRetry();
     currentVideoPath_.clear();
     const std::wstring text = L"동영상을 재생할 수 없습니다.\n\n" + reason;
     MessageBoxW(window_, text.c_str(), kAppTitle, MB_OK | MB_ICONERROR);
 }
 
 void MainWindow::Open(const std::wstring& path) {
-    KillTimer(window_, kDropRetryTimer);
-    dropRetryPath_.clear();
+    ClearOpenRetry();
     lastExplorerOpen_ = 0;
     if (IsSubtitleFile(path)) {
         AddSubtitle(path);
@@ -185,8 +216,7 @@ void MainWindow::OpenFiles(const std::vector<std::wstring>& paths) {
             Open(path);
         }
     } else {
-        KillTimer(window_, kDropRetryTimer);
-        dropRetryPath_.clear();
+        ClearOpenRetry();
         lastExplorerOpen_ = 0;
         SortByName(videos);
         StartPlaylist(std::move(videos), 0, {}, false);
@@ -199,7 +229,9 @@ void MainWindow::StartPlaylist(std::vector<std::wstring> files, size_t index, co
     keepWindowSize_ = false;
     ++seriesSearch_;
     KillTimer(window_, kSeriesTimer);
+    ArmOpenRetry(playlist_[playlistIndex_], preferredSubtitle);
     OpenVideo(playlist_[playlistIndex_], preferredSubtitle);
+    SyncPlaylistPanel();
     ShowControls();
     // The file plays at once; the rest of its series is looked for after a moment, which
     // also leaves time for more files of a selection to arrive from Explorer.
@@ -233,6 +265,7 @@ void MainWindow::HandleSeriesFound(LPARAM message) {
     if (itself != result->series.end()) {
         playlistIndex_ = static_cast<size_t>(itself - result->series.begin());
         playlist_ = std::move(result->series);
+        SyncPlaylistPanel();
     }
 }
 
@@ -240,11 +273,11 @@ void MainWindow::PlayPlaylistItem(size_t index) {
     if (index >= playlist_.size()) {
         return;
     }
-    KillTimer(window_, kDropRetryTimer);
-    dropRetryPath_.clear();
     playlistIndex_ = index;
     keepWindowSize_ = !preferences_.fitWindowOnPlaylistChange;
+    ArmOpenRetry(playlist_[index]);
     OpenVideo(playlist_[index]);
+    SyncPlaylistPanel();
     player_->ShowMessage(std::to_wstring(index + 1) + L"/" + std::to_wstring(playlist_.size()) + L": " +
                          std::filesystem::path(playlist_[index]).filename().wstring());
     ShowControls();
@@ -335,6 +368,58 @@ void MainWindow::ShowPlaylist() {
     SaveCurrentSettings();
 }
 
+void MainWindow::TogglePlaylistPanel() {
+    if (!playlistPanel_) {
+        return;
+    }
+    const bool opening = !playlistPanel_->IsOpen();
+    if (opening) {
+        SetCursorHidden(false);
+        SyncPlaylistPanel();
+    }
+    playlistPanel_->SetOpen(opening);
+    ShowControls();
+}
+
+void MainWindow::SyncPlaylistPanel() {
+    if (!playlistPanel_) {
+        return;
+    }
+    playlistPanel_->SetPlaylist(playlist_, playlistIndex_);
+    playlistPanel_->SetOptions(preferences_.autoAdvance, preferences_.repeat);
+}
+
+void MainWindow::ToggleAutoAdvance() {
+    preferences_.autoAdvance = !preferences_.autoAdvance;
+    // Repeating the whole list means moving on, so it can't stay without that.
+    if (!preferences_.autoAdvance && preferences_.repeat == RepeatMode::All) {
+        preferences_.repeat = RepeatMode::None;
+    }
+    player_->ShowMessage(std::wstring(L"다음 파일 자동 재생") + (preferences_.autoAdvance ? L" 켬" : L" 끔"));
+    ApplyRepeatMode();
+    SaveCurrentSettings();
+    SyncPlaylistPanel();
+}
+
+void MainWindow::ToggleRepeatOne() {
+    preferences_.repeat = preferences_.repeat == RepeatMode::One ? RepeatMode::None : RepeatMode::One;
+    player_->ShowMessage(std::wstring(L"한 개 반복") + (preferences_.repeat == RepeatMode::One ? L" 켬" : L" 끔"));
+    ApplyRepeatMode();
+    SaveCurrentSettings();
+    SyncPlaylistPanel();
+}
+
+void MainWindow::ToggleRepeatAll() {
+    preferences_.repeat = preferences_.repeat == RepeatMode::All ? RepeatMode::None : RepeatMode::All;
+    if (preferences_.repeat == RepeatMode::All) {
+        preferences_.autoAdvance = true;
+    }
+    player_->ShowMessage(std::wstring(L"전체 목록 반복") + (preferences_.repeat == RepeatMode::All ? L" 켬" : L" 끔"));
+    ApplyRepeatMode();
+    SaveCurrentSettings();
+    SyncPlaylistPanel();
+}
+
 void MainWindow::OpenFromExplorer(const std::wstring& path) {
     if (!IsSubtitleFile(path)) {
         const ULONGLONG now = GetTickCount64();
@@ -350,6 +435,7 @@ void MainWindow::OpenFromExplorer(const std::wstring& path) {
             }
             SortByName(playlist_);
             playlistIndex_ = static_cast<size_t>(std::find(playlist_.begin(), playlist_.end(), playing) - playlist_.begin());
+            SyncPlaylistPanel();
             return;
         }
         Open(path);
@@ -358,8 +444,7 @@ void MainWindow::OpenFromExplorer(const std::wstring& path) {
     }
     const std::wstring video = FindVideoForSubtitle(path);
     if (!video.empty() && _wcsicmp(video.c_str(), currentVideoPath_.c_str()) != 0) {
-        KillTimer(window_, kDropRetryTimer);
-        dropRetryPath_.clear();
+        ClearOpenRetry();
         lastExplorerOpen_ = 0;
         StartPlaylist({video}, 0, path, true);
     } else if (!currentVideoPath_.empty()) {
@@ -433,7 +518,7 @@ void MainWindow::ApplyDefaultWindowSize() {
 }
 
 void MainWindow::HandleVideoReady(int width, int height) {
-    dropRetryPath_.clear();
+    ClearOpenRetry();
     if (!pendingSubtitleName_.empty()) {
         for (const MediaTrack& track : playback_.tracks) {
             if (track.type == TrackType::Subtitle && _wcsicmp(track.externalFileName.c_str(), pendingSubtitleName_.c_str()) == 0) {
@@ -610,6 +695,9 @@ void MainWindow::ApplyPreferences(const Preferences& preferences) {
         player_->SetSubtitleStyle(preferences.subtitleStyle);
     }
     preferences_ = preferences;
+    if (playlistPanel_) {
+        playlistPanel_->SetToggleShortcut(preferences_.shortcuts[static_cast<size_t>(ShortcutAction::PlaylistShow)]);
+    }
     SaveCurrentSettings();
 }
 
@@ -698,10 +786,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             HandleIdleTimeout();
         } else if (wParam == ControlBar::kFadeTimerId && controlBar_) {
             controlBar_->HandleFadeTimer();
-        } else if (wParam == kDropRetryTimer) {
-            KillTimer(window_, kDropRetryTimer);
-            if (!dropRetryPath_.empty()) {
-                OpenVideo(dropRetryPath_);
+        } else if (wParam == kOpenRetryTimer) {
+            KillTimer(window_, kOpenRetryTimer);
+            if (!openRetryPath_.empty()) {
+                OpenVideo(openRetryPath_, openRetrySubtitle_);
             }
         } else if (wParam == kSeriesTimer) {
             KillTimer(window_, kSeriesTimer);
@@ -739,9 +827,10 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         SaveCurrentSettings();
-        KillTimer(window_, kDropRetryTimer);
+        ClearOpenRetry();
         // mpv renders into videoWindow_, so stop it before the window goes away.
         player_.reset();
+        playlistPanel_.reset();
         controlBar_.reset();
         {
             std::error_code error;
@@ -760,11 +849,13 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 void MainWindow::LayoutChildren() {
     RECT client{};
     GetClientRect(window_, &client);
+    const UINT dpi = GetDpiForWindow(window_);
+    const int panelWidth = playlistPanel_ ? playlistPanel_->Layout(client.right, client.bottom, dpi) : 0;
     if (videoWindow_) {
         MoveWindow(videoWindow_, 0, 0, client.right, client.bottom, TRUE);
     }
     if (controlBar_) {
-        controlBar_->Resize(client.right, client.bottom, GetDpiForWindow(window_));
+        controlBar_->Resize(std::max(0, static_cast<int>(client.right) - panelWidth), client.bottom, dpi);
     }
 }
 
@@ -774,7 +865,18 @@ void MainWindow::ShowControls() {
 }
 
 bool MainWindow::HandleKeyDown(WPARAM key, bool isRepeat) {
-    const std::optional<ShortcutAction> action = FindShortcut(preferences_.shortcuts, ChordFromKey(key));
+    const KeyChord chord = ChordFromKey(key);
+    const std::optional<ShortcutAction> action = FindShortcut(preferences_.shortcuts, chord);
+    if (chord == VK_ESCAPE && playlistPanel_ && playlistPanel_->IsOpen() && action != ShortcutAction::PlaylistShow) {
+        MSG character{};
+        while (PeekMessageW(&character, window_, WM_CHAR, WM_DEADCHAR, PM_REMOVE) ||
+               PeekMessageW(&character, window_, WM_SYSCHAR, WM_SYSDEADCHAR, PM_REMOVE)) {
+        }
+        if (!isRepeat) {
+            playlistPanel_->SetOpen(false);
+        }
+        return true;
+    }
     if (!action) {
         return false;
     }
@@ -924,7 +1026,7 @@ void MainWindow::RunShortcut(ShortcutAction action) {
         SetWindowSizePercent(200);
         break;
     case ShortcutAction::PlaylistShow:
-        ShowPlaylist();
+        TogglePlaylistPanel();
         break;
     case ShortcutAction::PlaylistNext:
         PlayNext(false);
@@ -1225,6 +1327,9 @@ void MainWindow::HandleMouseLeave() {
 }
 
 void MainWindow::HandleLeftButtonDown(POINT point) {
+    if (GetFocus() != window_) {
+        SetFocus(window_);
+    }
     switch (controlBar_->HitTest(point)) {
     case ControlBar::Part::PlayPause:
         player_->TogglePause();
@@ -1310,7 +1415,7 @@ void MainWindow::HandleIdleTimeout() {
     if (!playback_.paused || dialogOpen_) {
         controlBar_->SetVisible(false);
     }
-    if (fullscreen_ && !dialogOpen_) {
+    if (fullscreen_ && !dialogOpen_ && !(playlistPanel_ && playlistPanel_->IsOpen())) {
         SetCursorHidden(true);
     }
 }
@@ -1330,15 +1435,15 @@ void MainWindow::HandleDroppedFiles(HDROP drop) {
 
     if (!paths.empty()) {
         OpenFiles(paths);
-        if (!playlist_.empty() && !IsSubtitleFile(paths.front())) {
-            dropRetryPath_ = playlist_[playlistIndex_];
-            dropRetryCount_ = 0;
-        }
         SetForegroundWindow(window_);
     }
 }
 
 void MainWindow::HandleStateChanged(const PlaybackState& state) {
+    if (!openRetryPath_.empty() && state.position && *state.position > 0.0 && !state.fileName.empty() &&
+        _wcsicmp(std::filesystem::path(openRetryPath_).filename().c_str(), state.fileName.c_str()) == 0) {
+        ClearOpenRetry();
+    }
     const bool reachedEnd = state.atEnd && !playback_.atEnd && !state.fileName.empty();
     const bool delayChanged = state.subtitleDelay != playback_.subtitleDelay;
     const bool loopChanged = state.loopStart != playback_.loopStart || state.loopEnd != playback_.loopEnd;

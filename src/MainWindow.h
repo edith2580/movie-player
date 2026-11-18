@@ -14,6 +14,7 @@
 #include "ContextMenu.h"
 #include "ControlBar.h"
 #include "MpvPlayer.h"
+#include "PlaylistPanel.h"
 #include "Settings.h"
 
 // The top-level window. It takes all keyboard and mouse input and turns it into
@@ -69,7 +70,12 @@ private:
     void PlayPlaylistItem(size_t index);
     void PlayNext(bool automatic);
     void PlayPrevious();
-    void ShowPlaylist();
+    void ShowPlaylist();  // Legacy popup submenu implementation kept as backup.
+    void TogglePlaylistPanel();
+    void SyncPlaylistPanel();
+    void ToggleAutoAdvance();
+    void ToggleRepeatOne();
+    void ToggleRepeatAll();
     // At the cursor, or centered on the window if the cursor is outside it.
     PopupPlace PopupPlaceForKeys() const;
     void FindSeriesInBackground();
@@ -101,6 +107,8 @@ private:
     void ResetAudioDelay();
     void SetVolumeFromPointer(int clientX);
     void ApplyDefaultWindowSize();
+    void ArmOpenRetry(const std::wstring& path, const std::wstring& preferredSubtitle = {});
+    void ClearOpenRetry();
     void HandleVideoReady(int width, int height);
     void HandlePlaybackError(const std::wstring& reason, bool unrecognizedFormat);
     // Sizes the window to show the video at this scale, as far as the monitor allows.
@@ -115,6 +123,7 @@ private:
     HWND window_ = nullptr;
     HWND videoWindow_ = nullptr;
     std::unique_ptr<ControlBar> controlBar_;
+    std::unique_ptr<PlaylistPanel> playlistPanel_;
     std::unique_ptr<MpvPlayer> player_;
     PlaybackState playback_;
     Preferences preferences_;
@@ -130,8 +139,9 @@ private:
     ULONGLONG lastExplorerOpen_ = 0;  // When a video last came from Explorer, to group a multi-file selection.
     unsigned seriesSearch_ = 0;  // Counts searches, so a late result for an old playlist is ignored.
 
-    std::wstring dropRetryPath_;  // The dropped video being opened. Empty once it's settled.
-    size_t dropRetryCount_ = 0;
+    std::wstring openRetryPath_;  // Video being opened, retried on transient probe failures (e.g. network drives).
+    std::wstring openRetrySubtitle_;
+    size_t openRetryCount_ = 0;
 
     bool restoringPosition_ = false;
     bool startMaximized_ = false;
