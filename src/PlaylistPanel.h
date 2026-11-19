@@ -2,6 +2,10 @@
 
 #include <windows.h>
 
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wrl/client.h>
+
 #include <functional>
 #include <string>
 #include <vector>
@@ -9,20 +13,20 @@
 #include "Playlist.h"
 #include "Shortcuts.h"
 
-// A slide-out playlist panel docked to the right edge of the main window.
-// Uses native Windows controls and system theme colors to match the app's dialogs.
+// A separate modeless playlist dialog window docked outside the right edge
+// of the main window, accepting dragged files to append to the playlist.
 class PlaylistPanel {
 public:
     struct Callbacks {
-        std::function<void()> onAnimationStep;
         std::function<void(size_t index)> onPlayItem;
         std::function<void()> onToggleAutoAdvance;
         std::function<void()> onToggleRepeatOne;
         std::function<void()> onToggleRepeatAll;
         std::function<void()> onTogglePause;
+        std::function<void(const std::vector<std::wstring>& paths)> onFilesDropped;
     };
 
-    // Throws std::runtime_error if the panel window can't be created.
+    // Throws std::runtime_error if the window or graphics factories can't be created.
     PlaylistPanel(HWND mainWindow, HINSTANCE instance, Callbacks callbacks);
     ~PlaylistPanel();
 
@@ -31,16 +35,13 @@ public:
 
     void Toggle();
     void SetOpen(bool open);
-    bool IsOpen() const { return targetOpen_; }
-    bool IsVisible() const { return visibleWidth_ > 0 || animating_; }
+    bool IsOpen() const { return open_; }
     bool HasFocus() const;
 
     void SetPlaylist(const std::vector<std::wstring>& files, size_t currentIndex);
     void SetOptions(bool autoAdvance, RepeatMode repeat);
     void SetToggleShortcut(KeyChord shortcut) { toggleShortcut_ = shortcut; }
-
-    // Updates panel bounds inside mainWindow and returns its visible width on the right edge.
-    int Layout(int clientWidth, int clientHeight, UINT dpi);
+    void SyncToMainWindow();
 
 private:
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -50,16 +51,17 @@ private:
     bool HandleControlKeyDown(HWND control, WPARAM key);
 
     void CreateControls();
+    void CreateGraphics();
+    void DrawToggleButton(const DRAWITEMSTRUCT& draw);
     void UpdateFonts();
     void LayoutControls();
     void FitColumns();
     void RefreshList();
     void RefreshHeaderCount();
-    void RefreshOptionChecks();
-    void AdvanceAnimation();
-    void UpdatePanelBounds();
+    void RefreshOptionButtons();
+    RECT ComputeDockedRect() const;
+    void UpdateDockedState();
     void MoveFocusCycle(HWND current, bool backwards);
-    int TargetPanelWidth(int clientWidth, UINT dpi) const;
     int Dip(int value) const;
 
     HWND mainWindow_ = nullptr;
@@ -67,34 +69,34 @@ private:
     Callbacks callbacks_;
 
     HWND window_ = nullptr;
-    HWND titleLabel_ = nullptr;
+    HWND tooltip_ = nullptr;
     HWND countLabel_ = nullptr;
-    HWND closeButton_ = nullptr;
-    HWND autoAdvanceCheck_ = nullptr;
-    HWND repeatOneCheck_ = nullptr;
-    HWND repeatAllCheck_ = nullptr;
+    HWND autoAdvanceButton_ = nullptr;
+    HWND repeatOneButton_ = nullptr;
+    HWND repeatAllButton_ = nullptr;
     HWND list_ = nullptr;
     HWND emptyLabel_ = nullptr;
+    HWND hoveredButton_ = nullptr;
+    bool trackingHover_ = false;
+
+    Microsoft::WRL::ComPtr<ID2D1Factory> d2dFactory_;
+    Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> dcTarget_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush_;
+    Microsoft::WRL::ComPtr<IDWriteFactory> writeFactory_;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> badgeFormat_;
 
     HFONT font_ = nullptr;
     HFONT boldFont_ = nullptr;
     UINT dpi_ = 96;
     int clientWidth_ = 0;
     int clientHeight_ = 0;
-    int panelWidth_ = 0;
-    int visibleWidth_ = 0;
-
-    bool targetOpen_ = false;
-    bool animating_ = false;
-    double progress_ = 0.0;
-    double animFrom_ = 0.0;
-    double animTo_ = 0.0;
-    ULONGLONG animStart_ = 0;
+    int panelClientWidthDip_ = 300;
+    bool docked_ = true;
+    bool open_ = false;
 
     std::vector<std::wstring> files_;
     size_t currentIndex_ = 0;
     bool autoAdvance_ = true;
     RepeatMode repeat_ = RepeatMode::None;
-    bool updatingChecks_ = false;
     KeyChord toggleShortcut_ = VK_F6;
 };

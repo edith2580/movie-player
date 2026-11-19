@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <imm.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <memory>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -88,6 +90,29 @@ POINT PointFromLParam(LPARAM lParam) {
     return {static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
 }
 
+bool IsNetworkPath(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (path.find(L"://") != std::wstring::npos) {
+        return true;
+    }
+    std::wstring_view view(path);
+    if (view.starts_with(L"\\\\?\\UNC\\") || view.starts_with(L"\\\\.\\UNC\\")) {
+        return true;
+    }
+    if (view.starts_with(L"\\\\?\\") || view.starts_with(L"\\\\.\\")) {
+        view.remove_prefix(4);
+    } else if (view.starts_with(L"\\\\")) {
+        return true;
+    }
+    if (view.size() >= 2 && view[1] == L':') {
+        const wchar_t root[] = {view[0], L':', L'\\', L'\0'};
+        return GetDriveTypeW(root) == DRIVE_REMOTE;
+    }
+    return PathIsNetworkPathW(path.c_str()) != FALSE;
+}
+
 }  // namespace
 
 MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
@@ -127,7 +152,6 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
 
     controlBar_ = std::make_unique<ControlBar>(window_);
     PlaylistPanel::Callbacks panelCallbacks;
-    panelCallbacks.onAnimationStep = [this] { LayoutChildren(); };
     panelCallbacks.onPlayItem = [this](size_t index) { PlayPlaylistItem(index); };
     panelCallbacks.onToggleAutoAdvance = [this] { ToggleAutoAdvance(); };
     panelCallbacks.onToggleRepeatOne = [this] { ToggleRepeatOne(); };
@@ -136,6 +160,7 @@ MainWindow::MainWindow(HINSTANCE instance, const Settings& settings)
         player_->TogglePause();
         ShowControls();
     };
+    panelCallbacks.onFilesDropped = [this](const std::vector<std::wstring>& paths) { AddFilesToPlaylist(paths); };
     playlistPanel_ = std::make_unique<PlaylistPanel>(window_, instance, std::move(panelCallbacks));
     playlistPanel_->SetToggleShortcut(preferences_.shortcuts[static_cast<size_t>(ShortcutAction::PlaylistShow)]);
     SyncPlaylistPanel();
@@ -163,7 +188,10 @@ void MainWindow::Show(int showCommand) {
 }
 
 void MainWindow::ArmOpenRetry(const std::wstring& path, const std::wstring& preferredSubtitle) {
-    KillTimer(window_, kOpenRetryTimer);
+    ClearOpenRetry();
+    if (!IsNetworkPath(path)) {
+        return;
+    }
     openRetryPath_ = path;
     openRetrySubtitle_ = preferredSubtitle;
     openRetryCount_ = 0;
@@ -387,6 +415,71 @@ void MainWindow::SyncPlaylistPanel() {
     }
     playlistPanel_->SetPlaylist(playlist_, playlistIndex_);
     playlistPanel_->SetOptions(preferences_.autoAdvance, preferences_.repeat);
+}
+
+void MainWindow::AddFilesToPlaylist(const std::vector<std::wstring>& paths) {
+    std::vector<std::wstring> videos;
+    std::vector<std::wstring> subtitles;
+    for (const std::wstring& path : paths) {
+        std::error_code error;
+        if (std::filesystem::is_directory(path, error)) {
+            std::vector<std::wstring> folderVideos;
+            for (const auto& entry : std::filesystem::directory_iterator(path, error)) {
+                if (error) {
+                    break;
+                }
+                const std::wstring itemPath = entry.path().wstring();
+                if (entry.is_regular_file(error) && !IsSubtitleFile(itemPath)) {
+                    const std::wstring ext = entry.path().extension().wstring();
+                    const bool isVideo = std::any_of(kVideoExtensions.begin(), kVideoExtensions.end(),
+                                                     [&](const wchar_t* known) { return _wcsicmp(known, ext.c_str()) == 0; });
+                    if (isVideo) {
+                        folderVideos.push_back(itemPath);
+                    }
+                }
+            }
+            SortByName(folderVideos);
+            videos.insert(videos.end(), folderVideos.begin(), folderVideos.end());
+        } else if (IsSubtitleFile(path)) {
+            subtitles.push_back(path);
+        } else {
+            videos.push_back(path);
+        }
+    }
+
+    if (videos.empty()) {
+        for (const std::wstring& subtitle : subtitles) {
+            if (!currentVideoPath_.empty()) {
+                AddSubtitle(subtitle);
+            }
+        }
+        return;
+    }
+
+    SortByName(videos);
+    if (playlist_.empty()) {
+        StartPlaylist(std::move(videos), 0, {}, false);
+        return;
+    }
+
+    ++seriesSearch_;
+    KillTimer(window_, kSeriesTimer);
+
+    size_t added = 0;
+    for (const std::wstring& video : videos) {
+        const bool exists = std::any_of(playlist_.begin(), playlist_.end(),
+                                        [&](const std::wstring& existing) { return _wcsicmp(existing.c_str(), video.c_str()) == 0; });
+        if (!exists) {
+            playlist_.push_back(video);
+            ++added;
+        }
+    }
+    SyncPlaylistPanel();
+    if (added > 0) {
+        player_->ShowMessage(L"재생 목록에 " + std::to_wstring(added) + L"개 추가");
+    } else {
+        player_->ShowMessage(L"이미 재생 목록에 있는 파일입니다");
+    }
 }
 
 void MainWindow::ToggleAutoAdvance() {
@@ -662,6 +755,14 @@ void MainWindow::RunDialog(const std::function<void()>& show) {
     ShowControls();
 }
 
+void MainWindow::OpenVideoDialog() {
+    std::vector<std::wstring> paths;
+    RunDialog([this, &paths] { paths = PickVideoFiles(window_); });
+    if (!paths.empty()) {
+        OpenFiles(paths);
+    }
+}
+
 void MainWindow::OpenSettings() {
     RunDialog([this] {
         ShowSettingsDialog(window_, preferences_, [this](const Preferences& preferences) { ApplyPreferences(preferences); });
@@ -716,6 +817,11 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND window, UINT message, WPARAM wParam
 
 LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_WINDOWPOSCHANGED:
+        if (playlistPanel_) {
+            playlistPanel_->SyncToMainWindow();
+        }
+        return DefWindowProcW(window_, message, wParam, lParam);
     case WM_SIZE:
         LayoutChildren();
         return 0;
@@ -849,13 +955,11 @@ LRESULT MainWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 void MainWindow::LayoutChildren() {
     RECT client{};
     GetClientRect(window_, &client);
-    const UINT dpi = GetDpiForWindow(window_);
-    const int panelWidth = playlistPanel_ ? playlistPanel_->Layout(client.right, client.bottom, dpi) : 0;
     if (videoWindow_) {
         MoveWindow(videoWindow_, 0, 0, client.right, client.bottom, TRUE);
     }
     if (controlBar_) {
-        controlBar_->Resize(std::max(0, static_cast<int>(client.right) - panelWidth), client.bottom, dpi);
+        controlBar_->Resize(client.right, client.bottom, GetDpiForWindow(window_));
     }
 }
 
@@ -865,27 +969,35 @@ void MainWindow::ShowControls() {
 }
 
 bool MainWindow::HandleKeyDown(WPARAM key, bool isRepeat) {
-    const KeyChord chord = ChordFromKey(key);
-    const std::optional<ShortcutAction> action = FindShortcut(preferences_.shortcuts, chord);
-    if (chord == VK_ESCAPE && playlistPanel_ && playlistPanel_->IsOpen() && action != ShortcutAction::PlaylistShow) {
+    const auto drainChars = [this] {
+        // The message loop has already queued the key's character. A menu opened by this
+        // shortcut would take it as a search for an item, and beep when none matched.
         MSG character{};
         while (PeekMessageW(&character, window_, WM_CHAR, WM_DEADCHAR, PM_REMOVE) ||
                PeekMessageW(&character, window_, WM_SYSCHAR, WM_SYSDEADCHAR, PM_REMOVE)) {
         }
+    };
+
+    const KeyChord chord = ChordFromKey(key);
+    const std::optional<ShortcutAction> action = FindShortcut(preferences_.shortcuts, chord);
+    if (chord == VK_ESCAPE && playlistPanel_ && playlistPanel_->IsOpen() && action != ShortcutAction::PlaylistShow) {
+        drainChars();
         if (!isRepeat) {
             playlistPanel_->SetOpen(false);
+        }
+        return true;
+    }
+    if (chord == VK_RETURN && currentVideoPath_.empty() && playback_.fileName.empty()) {
+        drainChars();
+        if (!isRepeat) {
+            OpenVideoDialog();
         }
         return true;
     }
     if (!action) {
         return false;
     }
-    // The message loop has already queued the key's character. A menu opened by this
-    // shortcut would take it as a search for an item, and beep when none matched.
-    MSG character{};
-    while (PeekMessageW(&character, window_, WM_CHAR, WM_DEADCHAR, PM_REMOVE) ||
-           PeekMessageW(&character, window_, WM_SYSCHAR, WM_SYSDEADCHAR, PM_REMOVE)) {
-    }
+    drainChars();
     if (!isRepeat || GetShortcutInfo(*action).repeats) {
         RunShortcut(*action);
     }
@@ -1179,13 +1291,9 @@ void MainWindow::HandleContextMenu(POINT screenPoint) {
     ShowControls();
 
     switch (choice.action) {
-    case MenuChoice::Action::OpenVideo: {
-        const std::vector<std::wstring> paths = PickVideoFiles(window_);
-        if (!paths.empty()) {
-            OpenFiles(paths);
-        }
+    case MenuChoice::Action::OpenVideo:
+        OpenVideoDialog();
         break;
-    }
     case MenuChoice::Action::OpenSubtitle: {
         const std::wstring path = PickSubtitleFile(window_);
         if (!path.empty()) {

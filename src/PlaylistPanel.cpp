@@ -1,6 +1,8 @@
 #include "PlaylistPanel.h"
 
 #include <commctrl.h>
+#include <d2d1helper.h>
+#include <dwmapi.h>
 #include <imm.h>
 #include <shellapi.h>
 
@@ -13,27 +15,24 @@
 
 namespace {
 
-constexpr wchar_t kPanelClassName[] = L"MoviePlayer.PlaylistPanel";
-constexpr UINT_PTR kSlideTimerId = 1;
-constexpr UINT kSlideTimerMs = 15;
-constexpr double kSlideDurationMs = 180.0;
+constexpr wchar_t kPanelClassName[] = L"MoviePlayer.PlaylistWindow";
+constexpr wchar_t kPanelTitle[] = L"재생 목록";
+constexpr int kAppIconId = 1;
 constexpr UINT_PTR kControlSubclassId = 1;
 
-constexpr int kIdClose = 101;
 constexpr int kIdAutoAdvance = 102;
 constexpr int kIdRepeatOne = 103;
 constexpr int kIdRepeatAll = 104;
 constexpr int kIdList = 105;
 
-constexpr int kDefaultPanelWidthDip = 300;
-constexpr int kMinPanelWidthDip = 200;
-constexpr int kPaddingDip = 12;
-constexpr int kHeaderHeightDip = 38;
-constexpr int kCloseButtonSizeDip = 24;
-constexpr int kOptionRowHeightDip = 20;
-constexpr int kOptionRowGapDip = 4;
-constexpr int kOptionVerticalPadDip = 8;
-constexpr int kIndicatorColumnDip = 24;
+constexpr int kMinWindowWidthDip = 240;
+constexpr int kMinWindowHeightDip = 260;
+constexpr int kPaddingDip = 10;
+constexpr int kToolbarHeightDip = 40;
+constexpr int kToggleWidthDip = 30;
+constexpr int kToggleHeightDip = 28;
+constexpr int kToggleGapDip = 6;
+constexpr int kDockSnapDip = 24;
 
 void RegisterPanelClass(HINSTANCE instance) {
     WNDCLASSEXW existing{};
@@ -44,6 +43,8 @@ void RegisterPanelClass(HINSTANCE instance) {
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = &PlaylistPanel::WindowProc;
     windowClass.hInstance = instance;
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(kAppIconId));
+    windowClass.hIconSm = windowClass.hIcon;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = kPanelClassName;
@@ -59,6 +60,42 @@ void DrainQueuedChars(HWND window) {
     }
 }
 
+RECT VisibleWindowBounds(HWND window) {
+    RECT rect{};
+    if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect)))) {
+        GetWindowRect(window, &rect);
+    }
+    return rect;
+}
+
+D2D1_COLOR_F ColorFromSys(int sysColorIndex, float alpha = 1.0f) {
+    const COLORREF color = GetSysColor(sysColorIndex);
+    return D2D1::ColorF(static_cast<float>(GetRValue(color)) / 255.0f,
+                        static_cast<float>(GetGValue(color)) / 255.0f,
+                        static_cast<float>(GetBValue(color)) / 255.0f,
+                        alpha);
+}
+
+D2D1_COLOR_F BlendColors(D2D1_COLOR_F base, D2D1_COLOR_F tint, float amount) {
+    return D2D1::ColorF(base.r + (tint.r - base.r) * amount,
+                        base.g + (tint.g - base.g) * amount,
+                        base.b + (tint.b - base.b) * amount,
+                        1.0f);
+}
+
+void AddTooltip(HWND tooltip, HWND owner, HWND control, const wchar_t* text) {
+    if (!tooltip) {
+        return;
+    }
+    TOOLINFOW info{};
+    info.cbSize = sizeof(info);
+    info.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+    info.hwnd = owner;
+    info.uId = reinterpret_cast<UINT_PTR>(control);
+    info.lpszText = const_cast<wchar_t*>(text);
+    SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+}
+
 }  // namespace
 
 PlaylistPanel::PlaylistPanel(HWND mainWindow, HINSTANCE instance, Callbacks callbacks)
@@ -70,21 +107,23 @@ PlaylistPanel::PlaylistPanel(HWND mainWindow, HINSTANCE instance, Callbacks call
     dpi_ = GetDpiForWindow(mainWindow_);
 
     window_ = CreateWindowExW(
-        0, kPanelClassName, nullptr,
-        WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        0, 0, 0, 0,
+        WS_EX_ACCEPTFILES,
+        kPanelClassName,
+        kPanelTitle,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
+        CW_USEDEFAULT, CW_USEDEFAULT, Dip(panelClientWidthDip_), Dip(480),
         mainWindow_, nullptr, instance_, this);
     if (!window_) {
         throw std::runtime_error("CreateWindowEx failed for PlaylistPanel");
     }
 
     ImmAssociateContextEx(window_, nullptr, 0);
-    DragAcceptFiles(window_, TRUE);
 
+    CreateGraphics();
     CreateControls();
     UpdateFonts();
     RefreshHeaderCount();
-    RefreshOptionChecks();
+    RefreshOptionButtons();
     RefreshList();
 }
 
@@ -107,36 +146,38 @@ int PlaylistPanel::Dip(int value) const {
     return MulDiv(value, static_cast<int>(dpi_), 96);
 }
 
-int PlaylistPanel::TargetPanelWidth(int clientWidth, UINT dpi) const {
-    const int preferred = MulDiv(kDefaultPanelWidthDip, static_cast<int>(dpi), 96);
-    const int minimum = MulDiv(kMinPanelWidthDip, static_cast<int>(dpi), 96);
-    const int capped = std::max(minimum, clientWidth * 45 / 100);
-    return std::min(clientWidth, std::min(preferred, capped));
-}
-
 void PlaylistPanel::Toggle() {
-    SetOpen(!targetOpen_);
+    SetOpen(!open_);
 }
 
 void PlaylistPanel::SetOpen(bool open) {
-    if (open == targetOpen_ && !animating_) {
+    if (open == open_) {
         if (open) {
-            SetFocus(list_);
+            SetForegroundWindow(window_);
+            SetFocus(files_.empty() ? autoAdvanceButton_ : list_);
         }
         return;
     }
-    targetOpen_ = open;
-    animFrom_ = progress_;
-    animTo_ = open ? 1.0 : 0.0;
-    animStart_ = GetTickCount64();
-    animating_ = true;
+    open_ = open;
 
     if (open) {
-        UpdatePanelBounds();
-        ShowWindow(window_, SW_SHOWNOACTIVATE);
-        SetFocus(files_.empty() ? autoAdvanceCheck_ : list_);
+        docked_ = true;
+        const RECT target = ComputeDockedRect();
+        SetWindowPos(window_, HWND_TOP, target.left, target.top, target.right - target.left, target.bottom - target.top,
+                     SWP_NOACTIVATE);
+        ShowWindow(window_, SW_SHOW);
+        SetForegroundWindow(window_);
+        SetFocus(files_.empty() ? autoAdvanceButton_ : list_);
+    } else {
+        hoveredButton_ = nullptr;
+        trackingHover_ = false;
+        const bool returnFocus = GetActiveWindow() == window_ || HasFocus();
+        ShowWindow(window_, SW_HIDE);
+        if (returnFocus) {
+            SetForegroundWindow(mainWindow_);
+            SetFocus(mainWindow_);
+        }
     }
-    SetTimer(window_, kSlideTimerId, kSlideTimerMs, nullptr);
 }
 
 bool PlaylistPanel::HasFocus() const {
@@ -154,13 +195,9 @@ void PlaylistPanel::SetPlaylist(const std::vector<std::wstring>& files, size_t c
 
     if (sameFiles && !files_.empty()) {
         if (previousIndex != currentIndex_) {
-            wchar_t emptyText[] = L"";
-            wchar_t activeMark[] = L"▶";
             if (previousIndex < files_.size()) {
-                ListView_SetItemText(list_, static_cast<int>(previousIndex), 0, emptyText);
                 ListView_RedrawItems(list_, static_cast<int>(previousIndex), static_cast<int>(previousIndex));
             }
-            ListView_SetItemText(list_, static_cast<int>(currentIndex_), 0, activeMark);
             ListView_RedrawItems(list_, static_cast<int>(currentIndex_), static_cast<int>(currentIndex_));
         }
         ListView_SetItemState(list_, static_cast<int>(currentIndex_), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -174,58 +211,84 @@ void PlaylistPanel::SetPlaylist(const std::vector<std::wstring>& files, size_t c
 void PlaylistPanel::SetOptions(bool autoAdvance, RepeatMode repeat) {
     autoAdvance_ = autoAdvance;
     repeat_ = repeat;
-    RefreshOptionChecks();
+    RefreshOptionButtons();
 }
 
-int PlaylistPanel::Layout(int clientWidth, int clientHeight, UINT dpi) {
-    const bool dpiChanged = dpi != dpi_;
-    clientWidth_ = clientWidth;
-    clientHeight_ = clientHeight;
-    dpi_ = dpi;
-    panelWidth_ = TargetPanelWidth(clientWidth, dpi);
-
-    if (dpiChanged) {
-        UpdateFonts();
-    }
-
-    visibleWidth_ = static_cast<int>(std::lround(static_cast<double>(panelWidth_) * progress_));
-    if (visibleWidth_ > 0 || animating_) {
-        UpdatePanelBounds();
-        LayoutControls();
-    }
-    return visibleWidth_;
-}
-
-void PlaylistPanel::UpdatePanelBounds() {
-    if (!window_ || clientHeight_ <= 0 || panelWidth_ <= 0) {
+void PlaylistPanel::SyncToMainWindow() {
+    if (!open_ || !docked_ || !IsWindowVisible(window_) || IsIconic(mainWindow_)) {
         return;
     }
-    const int x = clientWidth_ - visibleWidth_;
-    SetWindowPos(window_, HWND_TOP, x, 0, panelWidth_, clientHeight_, SWP_NOACTIVATE);
+    const RECT target = ComputeDockedRect();
+    SetWindowPos(window_, nullptr, target.left, target.top, target.right - target.left, target.bottom - target.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-void PlaylistPanel::AdvanceAnimation() {
-    const double elapsed = static_cast<double>(GetTickCount64() - animStart_);
-    const double t = std::clamp(elapsed / kSlideDurationMs, 0.0, 1.0);
-    // Cubic ease-out for both opening and closing keeps reversals responsive.
-    const double eased = 1.0 - std::pow(1.0 - t, 3.0);
-    progress_ = animFrom_ + (animTo_ - animFrom_) * eased;
-
-    if (t >= 1.0) {
-        progress_ = animTo_;
-        animating_ = false;
-        KillTimer(window_, kSlideTimerId);
-        if (!targetOpen_) {
-            if (HasFocus()) {
-                SetFocus(mainWindow_);
-            }
-            ShowWindow(window_, SW_HIDE);
-        }
+RECT PlaylistPanel::ComputeDockedRect() const {
+    const RECT mainFrame = VisibleWindowBounds(mainWindow_);
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if (!GetMonitorInfoW(MonitorFromWindow(mainWindow_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        return mainFrame;
     }
 
-    if (callbacks_.onAnimationStep) {
-        callbacks_.onAnimationStep();
+    const UINT targetDpi = GetDpiForWindow(mainWindow_);
+    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window_, GWL_STYLE));
+    const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(window_, GWL_EXSTYLE));
+    RECT frameOffset{};
+    AdjustWindowRectExForDpi(&frameOffset, style, FALSE, exStyle, targetDpi);
+
+    // On Windows 10/11, the left/right/bottom thick frame includes an invisible resize border
+    // outside DWMWA_EXTENDED_FRAME_BOUNDS; compensate so the visible edges sit flush.
+    const int borderX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, targetDpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, targetDpi);
+    const int borderY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, targetDpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, targetDpi);
+
+    const bool isFullscreen = mainFrame.left <= monitor.rcMonitor.left && mainFrame.top <= monitor.rcMonitor.top &&
+                              mainFrame.right >= monitor.rcMonitor.right && mainFrame.bottom >= monitor.rcMonitor.bottom;
+    const RECT& area = isFullscreen ? monitor.rcMonitor : monitor.rcWork;
+
+    const int clientWidth = MulDiv(panelClientWidthDip_, static_cast<int>(targetDpi), 96);
+    const int windowWidth = clientWidth + (frameOffset.right - frameOffset.left);
+    const int visibleWidth = windowWidth - borderX * 2;
+    const int visibleHeight = std::min<int>(mainFrame.bottom - mainFrame.top, area.bottom - area.top);
+    const int windowHeight = visibleHeight + borderY;
+
+    int visibleX = mainFrame.right;
+    if (visibleX + visibleWidth > area.right) {
+        visibleX = std::max<int>(area.left, area.right - visibleWidth);
     }
+    const int visibleY = std::clamp<int>(mainFrame.top, area.top, std::max<int>(area.top, area.bottom - visibleHeight));
+
+    const int left = visibleX - borderX;
+    const int top = visibleY;
+    return RECT{left, top, left + windowWidth, top + windowHeight};
+}
+
+void PlaylistPanel::UpdateDockedState() {
+    const RECT mainFrame = VisibleWindowBounds(mainWindow_);
+    const RECT selfFrame = VisibleWindowBounds(window_);
+    const int snap = Dip(kDockSnapDip);
+    docked_ = std::abs(selfFrame.left - mainFrame.right) <= snap && std::abs(selfFrame.top - mainFrame.top) <= snap;
+}
+
+void PlaylistPanel::CreateGraphics() {
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2dFactory_.GetAddressOf()))) {
+        throw std::runtime_error("D2D1CreateFactory failed for PlaylistPanel");
+    }
+    const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        static_cast<float>(dpi_), static_cast<float>(dpi_));
+    if (FAILED(d2dFactory_->CreateDCRenderTarget(&props, &dcTarget_)) ||
+        FAILED(dcTarget_->CreateSolidColorBrush(ColorFromSys(COLOR_WINDOWTEXT), &brush_))) {
+        throw std::runtime_error("CreateDCRenderTarget failed for PlaylistPanel");
+    }
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                   reinterpret_cast<IUnknown**>(writeFactory_.GetAddressOf()))) ||
+        FAILED(writeFactory_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                                               DWRITE_FONT_STRETCH_NORMAL, 8.5f, L"ko-KR", &badgeFormat_))) {
+        throw std::runtime_error("CreateTextFormat failed for PlaylistPanel");
+    }
+    badgeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    badgeFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 }
 
 void PlaylistPanel::CreateControls() {
@@ -233,39 +296,37 @@ void PlaylistPanel::CreateControls() {
         SetWindowSubclass(control, &PlaylistPanel::ControlSubclassProc, kControlSubclassId, reinterpret_cast<DWORD_PTR>(this));
     };
 
-    titleLabel_ = CreateWindowExW(
-        0, L"STATIC", L"재생 목록",
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
-        0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+    tooltip_ = CreateWindowExW(
+        WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        window_, nullptr, instance_, nullptr);
+
+    autoAdvanceButton_ = CreateWindowExW(
+        0, L"BUTTON", L"다음 파일 자동 재생",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdAutoAdvance)), instance_, nullptr);
+    subclass(autoAdvanceButton_);
+    AddTooltip(tooltip_, window_, autoAdvanceButton_, L"다음 파일 자동 재생");
+
+    repeatOneButton_ = CreateWindowExW(
+        0, L"BUTTON", L"한 개 반복",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdRepeatOne)), instance_, nullptr);
+    subclass(repeatOneButton_);
+    AddTooltip(tooltip_, window_, repeatOneButton_, L"한 개 반복");
+
+    repeatAllButton_ = CreateWindowExW(
+        0, L"BUTTON", L"전체 목록 반복",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdRepeatAll)), instance_, nullptr);
+    subclass(repeatAllButton_);
+    AddTooltip(tooltip_, window_, repeatAllButton_, L"전체 목록 반복");
 
     countLabel_ = CreateWindowExW(
         0, L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE | SS_NOPREFIX,
         0, 0, 0, 0, window_, nullptr, instance_, nullptr);
-
-    closeButton_ = CreateWindowExW(
-        0, L"BUTTON", L"×",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdClose)), instance_, nullptr);
-    subclass(closeButton_);
-
-    autoAdvanceCheck_ = CreateWindowExW(
-        0, L"BUTTON", L"다음 파일 자동 재생",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdAutoAdvance)), instance_, nullptr);
-    subclass(autoAdvanceCheck_);
-
-    repeatOneCheck_ = CreateWindowExW(
-        0, L"BUTTON", L"한 개 반복",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdRepeatOne)), instance_, nullptr);
-    subclass(repeatOneCheck_);
-
-    repeatAllCheck_ = CreateWindowExW(
-        0, L"BUTTON", L"전체 목록 반복",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(kIdRepeatAll)), instance_, nullptr);
-    subclass(repeatAllCheck_);
 
     list_ = CreateWindowExW(
         0, WC_LISTVIEWW, nullptr,
@@ -277,19 +338,129 @@ void PlaylistPanel::CreateControls() {
 
     LVCOLUMNW col{};
     col.mask = LVCF_FMT | LVCF_TEXT;
-    col.fmt = LVCFMT_CENTER;
-    wchar_t col0[] = L"";
+    col.fmt = LVCFMT_LEFT;
+    wchar_t col0[] = L"파일";
     col.pszText = col0;
     ListView_InsertColumn(list_, 0, &col);
-    col.fmt = LVCFMT_LEFT;
-    wchar_t col1[] = L"파일";
-    col.pszText = col1;
-    ListView_InsertColumn(list_, 1, &col);
 
     emptyLabel_ = CreateWindowExW(
-        0, L"STATIC", L"재생 목록이 비어 있습니다",
-        WS_CHILD | SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX,
+        0, L"STATIC", L"재생 목록이 비어 있습니다.\n파일을 끌어다 놓으면 추가됩니다.",
+        WS_CHILD | SS_CENTER | SS_NOPREFIX,
         0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+}
+
+void PlaylistPanel::DrawToggleButton(const DRAWITEMSTRUCT& draw) {
+    const int id = static_cast<int>(draw.CtlID);
+    const bool checked = (id == kIdAutoAdvance && autoAdvance_) ||
+                         (id == kIdRepeatOne && repeat_ == RepeatMode::One) ||
+                         (id == kIdRepeatAll && repeat_ == RepeatMode::All);
+    const bool hovered = draw.hwndItem == hoveredButton_;
+    const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
+    const bool focused = (draw.itemState & ODS_FOCUS) != 0 && (draw.itemState & ODS_NOFOCUSRECT) == 0;
+
+    dcTarget_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
+    if (FAILED(dcTarget_->BindDC(draw.hDC, &draw.rcItem))) {
+        return;
+    }
+
+    const float width = static_cast<float>(draw.rcItem.right - draw.rcItem.left) * 96.0f / static_cast<float>(dpi_);
+    const float height = static_cast<float>(draw.rcItem.bottom - draw.rcItem.top) * 96.0f / static_cast<float>(dpi_);
+    const float cx = width * 0.5f;
+    const float cy = height * 0.5f;
+
+    const D2D1_COLOR_F windowBg = ColorFromSys(COLOR_WINDOW);
+    const D2D1_COLOR_F textColor = ColorFromSys(COLOR_WINDOWTEXT);
+    const D2D1_COLOR_F mutedColor = ColorFromSys(COLOR_GRAYTEXT);
+    const D2D1_COLOR_F accent = ColorFromSys(COLOR_HIGHLIGHT);
+    const D2D1_COLOR_F activeStroke = ColorFromSys(COLOR_HOTLIGHT);
+
+    dcTarget_->BeginDraw();
+    dcTarget_->Clear(windowBg);
+
+    const D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(D2D1::RectF(1.0f, 1.0f, width - 1.0f, height - 1.0f), 4.0f, 4.0f);
+    if (checked) {
+        const float fillAmount = pressed ? 0.28f : hovered ? 0.22f : 0.14f;
+        const float borderAlpha = hovered || pressed ? 0.70f : 0.45f;
+        brush_->SetColor(BlendColors(windowBg, accent, fillAmount));
+        dcTarget_->FillRoundedRectangle(pill, brush_.Get());
+        brush_->SetColor(D2D1::ColorF(activeStroke.r, activeStroke.g, activeStroke.b, borderAlpha));
+        dcTarget_->DrawRoundedRectangle(pill, brush_.Get(), 1.0f);
+    } else if (pressed || hovered) {
+        const float fillAmount = pressed ? 0.14f : 0.08f;
+        brush_->SetColor(BlendColors(windowBg, textColor, fillAmount));
+        dcTarget_->FillRoundedRectangle(pill, brush_.Get());
+        brush_->SetColor(BlendColors(windowBg, textColor, 0.18f));
+        dcTarget_->DrawRoundedRectangle(pill, brush_.Get(), 1.0f);
+    }
+
+    const D2D1_COLOR_F iconColor = checked ? activeStroke : (hovered || pressed ? textColor : mutedColor);
+    brush_->SetColor(iconColor);
+
+    if (id == kIdAutoAdvance) {
+        // Play-next icon (triangle + vertical bar).
+        Microsoft::WRL::ComPtr<ID2D1PathGeometry> triangle;
+        Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+        if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&triangle)) && SUCCEEDED(triangle->Open(&sink))) {
+            sink->BeginFigure(D2D1::Point2F(cx - 5.5f, cy - 5.0f), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(D2D1::Point2F(cx + 1.8f, cy));
+            sink->AddLine(D2D1::Point2F(cx - 5.5f, cy + 5.0f));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            if (SUCCEEDED(sink->Close())) {
+                dcTarget_->FillGeometry(triangle.Get(), brush_.Get());
+            }
+        }
+        dcTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(cx + 3.5f, cy - 4.8f, cx + 5.5f, cy + 4.8f), 0.8f, 0.8f), brush_.Get());
+    } else {
+        // Repeat loop: top arc/bar pointing right, bottom arc/bar pointing left.
+        const float stroke = 1.6f;
+        const auto drawLoop = [&](float dir) {
+            Microsoft::WRL::ComPtr<ID2D1PathGeometry> path;
+            Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink))) {
+                sink->BeginFigure(D2D1::Point2F(cx - dir * 6.5f, cy - dir * 1.0f), D2D1_FIGURE_BEGIN_HOLLOW);
+                sink->AddLine(D2D1::Point2F(cx - dir * 6.5f, cy - dir * 2.8f));
+                sink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(cx - dir * 4.5f, cy - dir * 4.8f),
+                    D2D1::SizeF(2.0f, 2.0f), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                sink->AddLine(D2D1::Point2F(cx + dir * 4.8f, cy - dir * 4.8f));
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                if (SUCCEEDED(sink->Close())) {
+                    dcTarget_->DrawGeometry(path.Get(), brush_.Get(), stroke);
+                }
+            }
+
+            Microsoft::WRL::ComPtr<ID2D1PathGeometry> arrow;
+            Microsoft::WRL::ComPtr<ID2D1GeometrySink> arrowSink;
+            if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&arrow)) && SUCCEEDED(arrow->Open(&arrowSink))) {
+                const float tipX = cx + dir * 6.8f;
+                const float baseX = cx + dir * 3.4f;
+                const float tipY = cy - dir * 4.8f;
+                arrowSink->BeginFigure(D2D1::Point2F(baseX, tipY - 2.6f), D2D1_FIGURE_BEGIN_FILLED);
+                arrowSink->AddLine(D2D1::Point2F(tipX, tipY));
+                arrowSink->AddLine(D2D1::Point2F(baseX, tipY + 2.6f));
+                arrowSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                if (SUCCEEDED(arrowSink->Close())) {
+                    dcTarget_->FillGeometry(arrow.Get(), brush_.Get());
+                }
+            }
+        };
+        drawLoop(1.0f);
+        drawLoop(-1.0f);
+
+        if (id == kIdRepeatOne) {
+            const D2D1_RECT_F badgeRect = D2D1::RectF(cx - 4.0f, cy - 5.0f, cx + 4.0f, cy + 5.0f);
+            dcTarget_->DrawTextW(L"1", 1, badgeFormat_.Get(), badgeRect, brush_.Get());
+        }
+    }
+
+    if (focused) {
+        brush_->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.85f));
+        dcTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(2.5f, 2.5f, width - 2.5f, height - 2.5f), 3.0f, 3.0f), brush_.Get(), 1.0f);
+    }
+
+    dcTarget_->EndDraw();
 }
 
 void PlaylistPanel::UpdateFonts() {
@@ -306,15 +477,13 @@ void PlaylistPanel::UpdateFonts() {
 
     HFONT nextRegular = CreateFontIndirectW(&baseFont);
     LOGFONTW bold = baseFont;
-    bold.lfWeight = FW_SEMIBOLD;
+    bold.lfWeight = FW_BOLD;
     HFONT nextBold = CreateFontIndirectW(&bold);
 
-    const std::array<HWND, 7> regularControls{
-        countLabel_, closeButton_, autoAdvanceCheck_, repeatOneCheck_, repeatAllCheck_, list_, emptyLabel_};
+    const std::array<HWND, 3> regularControls{countLabel_, list_, emptyLabel_};
     for (HWND control : regularControls) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(nextRegular), TRUE);
     }
-    SendMessageW(titleLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(nextBold), TRUE);
 
     if (font_) {
         DeleteObject(font_);
@@ -327,41 +496,35 @@ void PlaylistPanel::UpdateFonts() {
 }
 
 void PlaylistPanel::LayoutControls() {
-    if (panelWidth_ <= 0 || clientHeight_ <= 0) {
+    if (clientWidth_ <= 0 || clientHeight_ <= 0) {
         return;
     }
     const int pad = Dip(kPaddingDip);
-    const int leftEdge = 1;  // Leave room for the 1px vertical separator on the left.
-    const int headerHeight = Dip(kHeaderHeightDip);
-    const int closeSize = Dip(kCloseButtonSizeDip);
-    const int innerLeft = leftEdge + pad;
-    const int innerWidth = std::max(0, panelWidth_ - leftEdge - pad * 2);
+    const int toolbarHeight = Dip(kToolbarHeightDip);
+    const int btnWidth = Dip(kToggleWidthDip);
+    const int btnHeight = Dip(kToggleHeightDip);
+    const int gap = Dip(kToggleGapDip);
+    const int btnY = (toolbarHeight - btnHeight) / 2;
 
-    const int closeX = std::max(innerLeft, panelWidth_ - pad - closeSize);
-    const int closeY = (headerHeight - closeSize) / 2;
-    MoveWindow(closeButton_, closeX, closeY, closeSize, closeSize, TRUE);
+    int x = pad;
+    MoveWindow(autoAdvanceButton_, x, btnY, btnWidth, btnHeight, TRUE);
+    x += btnWidth + gap;
+    MoveWindow(repeatOneButton_, x, btnY, btnWidth, btnHeight, TRUE);
+    x += btnWidth + gap;
+    MoveWindow(repeatAllButton_, x, btnY, btnWidth, btnHeight, TRUE);
+    x += btnWidth + gap;
 
-    const int countWidth = Dip(72);
-    const int countX = std::max(innerLeft, closeX - Dip(6) - countWidth);
-    const int titleWidth = std::max(0, countX - innerLeft - Dip(6));
-    MoveWindow(titleLabel_, innerLeft, 0, titleWidth, headerHeight - 1, TRUE);
-    MoveWindow(countLabel_, countX, 0, std::max(0, closeX - Dip(6) - countX), headerHeight - 1, TRUE);
+    const int countRight = std::max(x, clientWidth_ - pad);
+    MoveWindow(countLabel_, x, 0, countRight - x, toolbarHeight, TRUE);
 
-    int y = headerHeight + Dip(kOptionVerticalPadDip);
-    const int rowHeight = Dip(kOptionRowHeightDip);
-    const int rowGap = Dip(kOptionRowGapDip);
-    MoveWindow(autoAdvanceCheck_, innerLeft, y, innerWidth, rowHeight, TRUE);
-    y += rowHeight + rowGap;
-    MoveWindow(repeatOneCheck_, innerLeft, y, innerWidth, rowHeight, TRUE);
-    y += rowHeight + rowGap;
-    MoveWindow(repeatAllCheck_, innerLeft, y, innerWidth, rowHeight, TRUE);
-    y += rowHeight + Dip(kOptionVerticalPadDip);
-
-    const int listTop = y + 1;  // 1px horizontal divider above the list.
+    const int listTop = toolbarHeight + 1;  // 1px horizontal divider below the toolbar.
     const int listHeight = std::max(0, clientHeight_ - listTop);
-    const int listWidth = std::max(0, panelWidth_ - leftEdge);
-    MoveWindow(list_, leftEdge, listTop, listWidth, listHeight, TRUE);
-    MoveWindow(emptyLabel_, leftEdge, listTop, listWidth, listHeight, TRUE);
+    MoveWindow(list_, 0, listTop, clientWidth_, listHeight, TRUE);
+
+    const int emptyHeight = Dip(40);
+    const int emptyY = listTop + std::max(0, (listHeight - emptyHeight) / 2);
+    const int emptyWidth = std::max(0, clientWidth_ - pad * 2);
+    MoveWindow(emptyLabel_, pad, emptyY, emptyWidth, emptyHeight, TRUE);
     FitColumns();
     InvalidateRect(window_, nullptr, FALSE);
 }
@@ -369,10 +532,7 @@ void PlaylistPanel::LayoutControls() {
 void PlaylistPanel::FitColumns() {
     RECT rect{};
     GetClientRect(list_, &rect);
-    const int available = std::max(0, static_cast<int>(rect.right));
-    const int indicatorWidth = std::min(available, Dip(kIndicatorColumnDip));
-    ListView_SetColumnWidth(list_, 0, indicatorWidth);
-    ListView_SetColumnWidth(list_, 1, std::max(0, available - indicatorWidth));
+    ListView_SetColumnWidth(list_, 0, std::max(0, static_cast<int>(rect.right)));
 }
 
 void PlaylistPanel::RefreshHeaderCount() {
@@ -384,12 +544,12 @@ void PlaylistPanel::RefreshHeaderCount() {
     }
 }
 
-void PlaylistPanel::RefreshOptionChecks() {
-    updatingChecks_ = true;
-    SendMessageW(autoAdvanceCheck_, BM_SETCHECK, autoAdvance_ ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(repeatOneCheck_, BM_SETCHECK, repeat_ == RepeatMode::One ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(repeatAllCheck_, BM_SETCHECK, repeat_ == RepeatMode::All ? BST_CHECKED : BST_UNCHECKED, 0);
-    updatingChecks_ = false;
+void PlaylistPanel::RefreshOptionButtons() {
+    for (HWND button : {autoAdvanceButton_, repeatOneButton_, repeatAllButton_}) {
+        if (button) {
+            InvalidateRect(button, nullptr, FALSE);
+        }
+    }
 }
 
 void PlaylistPanel::RefreshList() {
@@ -401,15 +561,13 @@ void PlaylistPanel::RefreshList() {
     ListView_DeleteAllItems(list_);
 
     for (size_t i = 0; i < files_.size(); ++i) {
-        std::wstring mark = (i == currentIndex_) ? L"▶" : L"";
         std::wstring title = std::to_wstring(i + 1) + L". " + std::filesystem::path(files_[i]).filename().wstring();
 
         LVITEMW item{};
         item.mask = LVIF_TEXT;
         item.iItem = static_cast<int>(i);
-        item.pszText = mark.data();
+        item.pszText = title.data();
         ListView_InsertItem(list_, &item);
-        ListView_SetItemText(list_, static_cast<int>(i), 1, title.data());
     }
 
     if (!empty) {
@@ -423,11 +581,10 @@ void PlaylistPanel::RefreshList() {
 }
 
 void PlaylistPanel::MoveFocusCycle(HWND current, bool backwards) {
-    std::vector<HWND> stops{autoAdvanceCheck_, repeatOneCheck_, repeatAllCheck_};
+    std::vector<HWND> stops{autoAdvanceButton_, repeatOneButton_, repeatAllButton_};
     if (!files_.empty()) {
         stops.push_back(list_);
     }
-    stops.push_back(closeButton_);
 
     const auto it = std::find(stops.begin(), stops.end(), current);
     if (it == stops.end()) {
@@ -472,8 +629,35 @@ bool PlaylistPanel::HandleControlKeyDown(HWND control, WPARAM key) {
 LRESULT CALLBACK PlaylistPanel::ControlSubclassProc(HWND control, UINT message, WPARAM wParam, LPARAM lParam,
                                                     UINT_PTR subclassId, DWORD_PTR refData) {
     auto* self = reinterpret_cast<PlaylistPanel*>(refData);
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && self && self->HandleControlKeyDown(control, wParam)) {
-        return 0;
+    if (self) {
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && self->HandleControlKeyDown(control, wParam)) {
+            return 0;
+        }
+        if (control != self->list_) {
+            if (message == WM_MOUSEMOVE) {
+                if (self->hoveredButton_ != control) {
+                    HWND previous = self->hoveredButton_;
+                    self->hoveredButton_ = control;
+                    if (previous) {
+                        InvalidateRect(previous, nullptr, FALSE);
+                    }
+                    InvalidateRect(control, nullptr, FALSE);
+                }
+                if (!self->trackingHover_) {
+                    TRACKMOUSEEVENT track{sizeof(TRACKMOUSEEVENT), TME_LEAVE, control, 0};
+                    self->trackingHover_ = TrackMouseEvent(&track) != FALSE;
+                }
+            } else if (message == WM_MOUSELEAVE) {
+                self->trackingHover_ = false;
+                if (self->hoveredButton_ == control) {
+                    self->hoveredButton_ = nullptr;
+                    InvalidateRect(control, nullptr, FALSE);
+                }
+            } else if (message == WM_LBUTTONDBLCLK) {
+                // Fast repeated clicks on an icon toggle should act like a second click.
+                message = WM_LBUTTONDOWN;
+            }
+        }
     }
     if (message == WM_NCDESTROY) {
         RemoveWindowSubclass(control, &PlaylistPanel::ControlSubclassProc, subclassId);
@@ -496,10 +680,30 @@ LRESULT CALLBACK PlaylistPanel::WindowProc(HWND window, UINT message, WPARAM wPa
 
 LRESULT PlaylistPanel::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-    case WM_TIMER:
-        if (wParam == kSlideTimerId) {
-            AdvanceAnimation();
-        }
+    case WM_SIZE:
+        clientWidth_ = LOWORD(lParam);
+        clientHeight_ = HIWORD(lParam);
+        LayoutControls();
+        return 0;
+    case WM_DPICHANGED: {
+        dpi_ = HIWORD(wParam);
+        UpdateFonts();
+        const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(window_, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
+                     suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutControls();
+        RefreshOptionButtons();
+        return 0;
+    }
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = Dip(kMinWindowWidthDip);
+        info->ptMinTrackSize.y = Dip(kMinWindowHeightDip);
+        return 0;
+    }
+    case WM_EXITSIZEMOVE:
+        panelClientWidthDip_ = std::max(kMinWindowWidthDip - 20, MulDiv(clientWidth_, 96, static_cast<int>(dpi_)));
+        UpdateDockedState();
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -510,43 +714,30 @@ LRESULT PlaylistPanel::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         GetClientRect(window_, &client);
         FillRect(hdc, &client, GetSysColorBrush(COLOR_WINDOW));
 
-        // 1px border on the left edge separating the drawer from the video.
-        RECT leftBorder{0, 0, 1, client.bottom};
-        FillRect(hdc, &leftBorder, GetSysColorBrush(COLOR_BTNSHADOW));
-
-        // 1px dividers below the header and below the playback options.
-        const int headerBottom = Dip(kHeaderHeightDip) - 1;
-        RECT headerDivider{1, headerBottom, client.right, headerBottom + 1};
-        FillRect(hdc, &headerDivider, GetSysColorBrush(COLOR_BTNFACE));
-
-        const int optionsBottom = headerBottom + 1 + Dip(kOptionVerticalPadDip) * 2 +
-                                  Dip(kOptionRowHeightDip) * 3 + Dip(kOptionRowGapDip) * 2;
-        RECT optionsDivider{1, optionsBottom, client.right, optionsBottom + 1};
-        FillRect(hdc, &optionsDivider, GetSysColorBrush(COLOR_BTNFACE));
+        const int dividerY = Dip(kToolbarHeightDip);
+        RECT divider{0, dividerY, client.right, dividerY + 1};
+        FillRect(hdc, &divider, GetSysColorBrush(COLOR_BTNFACE));
 
         EndPaint(window_, &paint);
         return 0;
     }
+    case WM_DRAWITEM: {
+        const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (draw && draw->CtlType == ODT_BUTTON) {
+            DrawToggleButton(*draw);
+            return TRUE;
+        }
+        return FALSE;
+    }
     case WM_CTLCOLORSTATIC: {
         HDC hdc = reinterpret_cast<HDC>(wParam);
-        HWND control = reinterpret_cast<HWND>(lParam);
         SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
-        const bool secondary = control == countLabel_ || control == emptyLabel_;
-        SetTextColor(hdc, GetSysColor(secondary ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
-        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
-    }
-    case WM_CTLCOLORBTN: {
-        HDC hdc = reinterpret_cast<HDC>(wParam);
-        SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
-        SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+        SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
         return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_COMMAND:
-        if (HIWORD(wParam) == BN_CLICKED && !updatingChecks_) {
+        if (HIWORD(wParam) == BN_CLICKED) {
             switch (LOWORD(wParam)) {
-            case kIdClose:
-                SetOpen(false);
-                break;
             case kIdAutoAdvance:
                 if (callbacks_.onToggleAutoAdvance) {
                     callbacks_.onToggleAutoAdvance();
@@ -586,9 +777,6 @@ LRESULT PlaylistPanel::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                     const size_t item = static_cast<size_t>(draw->nmcd.dwItemSpec);
                     if (item == currentIndex_ && boldFont_) {
                         SelectObject(draw->nmcd.hdc, boldFont_);
-                        if ((draw->nmcd.uItemState & CDIS_SELECTED) == 0) {
-                            draw->clrText = GetSysColor(COLOR_HOTLIGHT);
-                        }
                         return CDRF_NEWFONT;
                     }
                     return CDRF_DODEFAULT;
@@ -604,12 +792,28 @@ LRESULT PlaylistPanel::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         }
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_LBUTTONDOWN:
-        SetFocus(files_.empty() ? autoAdvanceCheck_ : list_);
+        SetFocus(files_.empty() ? autoAdvanceButton_ : list_);
         return 0;
-    case WM_DROPFILES:
-        return SendMessageW(mainWindow_, WM_DROPFILES, wParam, lParam);
-    case WM_DESTROY:
-        KillTimer(window_, kSlideTimerId);
+    case WM_DROPFILES: {
+        HDROP drop = reinterpret_cast<HDROP>(wParam);
+        std::vector<std::wstring> paths;
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+            if (length > 0) {
+                std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+                DragQueryFileW(drop, i, buffer.data(), length + 1);
+                paths.emplace_back(buffer.data(), length);
+            }
+        }
+        DragFinish(drop);
+        if (!paths.empty() && callbacks_.onFilesDropped) {
+            callbacks_.onFilesDropped(paths);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        SetOpen(false);
         return 0;
     default:
         return DefWindowProcW(window_, message, wParam, lParam);

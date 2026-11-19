@@ -63,6 +63,7 @@ private:
 
     // Runs a blocking window over the video, keeping the bar and cursor out of its way.
     void RunDialog(const std::function<void()>& show);
+    void OpenVideoDialog();
     void OpenSettings();
     void ShowChapterList();
     // Starts a new playlist at index, and looks for the rest of the series if asked to.
@@ -73,6 +74,7 @@ private:
     void ShowPlaylist();  // Legacy popup submenu implementation kept as backup.
     void TogglePlaylistPanel();
     void SyncPlaylistPanel();
+    void AddFilesToPlaylist(const std::vector<std::wstring>& paths);
     void ToggleAutoAdvance();
     void ToggleRepeatOne();
     void ToggleRepeatAll();
